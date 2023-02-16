@@ -743,6 +743,14 @@ backend {{ genBackendNamePrefix $cfg.TLSTermination }}:{{ $cfgIdx }}
   {{- else }}
 # Avoiding binding ports until routing configuration has been synchronized.
   {{- end }}{{/* end bind ports after sync */}}
+
+# TODO: better/safer way to get haproxy to instantiate a map?
+{{- with $dynamicConfigManager }}
+backend be_dmc_dummy
+   # dummy backend end that is exists only to instantiate the dcm_name map
+   use-server %[base,map_reg(/var/lib/haproxy/conf/dcm_name.map)] if TRUE
+{{- end }}
+
 {{ end }}{{/* end haproxy config template */}}
 
 {{/*--------------------------------- END OF HAPROXY CONFIG, BELOW ARE MAPPING FILES ------------------------*/}}
@@ -832,3 +840,10 @@ backend {{ genBackendNamePrefix $cfg.TLSTermination }}:{{ $cfgIdx }}
   {{ $line }}
 {{ end -}}
 {{ end -}}{{/* end cert_config map template */}}
+
+{{ define "conf/dcm_name.map" -}}
+# dynamic name map
+# pxname,namesegment
+{{ end -}}{{/* end if dcm_name */ -}}
+
+

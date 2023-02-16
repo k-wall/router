@@ -117,9 +117,10 @@ var defaultCounterMetrics = []int{7, 8, 9, 13, 14, 21, 24, 39, 40, 41, 42, 43, 4
 // Exporter collects HAProxy stats from the given URI and exports them using
 // the prometheus metrics package.
 type Exporter struct {
-	opts  PrometheusOptions
-	mutex sync.RWMutex
-	fetch func() (io.ReadCloser, error)
+	opts        PrometheusOptions
+	mutex       sync.RWMutex
+	fetch       func() (io.ReadCloser, error)
+	fetchDcmMap func() (io.ReadCloser, error)
 
 	// lastScrape is the time the last scrape was invoked if at all
 	lastScrape *time.Time
@@ -162,11 +163,14 @@ func NewExporter(opts PrometheusOptions) (*Exporter, error) {
 	}
 
 	var fetch func() (io.ReadCloser, error)
+	var fetchMap func() (io.ReadCloser, error)
 	switch u.Scheme {
 	case "http", "https", "file":
 		fetch = fetchHTTP(opts.ScrapeURI, opts.Timeout)
 	case "unix":
-		fetch = fetchUnix(u, opts.Timeout)
+		fetch = fetchUnix(u, opts.Timeout, "show stat\n")
+		// if DCM enabled....
+		fetchMap = fetchUnix(u, opts.Timeout, "show map /var/lib/haproxy/conf/dcm_name.map\n")
 	default:
 		return nil, fmt.Errorf("unsupported scheme: %q", u.Scheme)
 	}
@@ -184,8 +188,10 @@ func NewExporter(opts PrometheusOptions) (*Exporter, error) {
 	}
 
 	return &Exporter{
-		opts:  opts,
-		fetch: fetch,
+		opts:        opts,
+		fetch:       fetch,
+		fetchDcmMap: fetchMap,
+
 		up: prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace: namespace,
 			Name:      "up",
@@ -380,7 +386,7 @@ func fetchHTTP(uri string, timeout time.Duration) func() (io.ReadCloser, error) 
 	}
 }
 
-func fetchUnix(u *url.URL, timeout time.Duration) func() (io.ReadCloser, error) {
+func fetchUnix(u *url.URL, timeout time.Duration, cmd string) func() (io.ReadCloser, error) {
 	return func() (io.ReadCloser, error) {
 		f, err := net.DialTimeout("unix", u.Path, timeout)
 		if err != nil {
@@ -390,7 +396,6 @@ func fetchUnix(u *url.URL, timeout time.Duration) func() (io.ReadCloser, error) 
 			f.Close()
 			return nil, err
 		}
-		cmd := "show stat\n"
 		n, err := io.WriteString(f, cmd)
 		if err != nil {
 			f.Close()
@@ -420,6 +425,41 @@ func (e *Exporter) scrape(record bool) {
 	}
 	defer body.Close()
 	e.up.Set(1)
+
+	// TODO: if DCM.....
+	dcmbody, err := e.fetchDcmMap()
+	if err != nil {
+		utilruntime.HandleError(fmt.Errorf("can't get dcm map HAProxy: %v", err))
+		return
+	}
+	defer dcmbody.Close()
+	dcmReader := csv.NewReader(dcmbody)
+	dcmReader.Comment = '#'
+	dcmReader.Comma = ' '
+
+	dcmLookup := make(map[string]string, 0)
+dcmloop:
+	for {
+		row, err := dcmReader.Read()
+
+		switch err {
+		case nil:
+		case io.EOF:
+			break dcmloop
+		default:
+			if _, ok := err.(*csv.ParseError); ok {
+				utilruntime.HandleError(fmt.Errorf("can't read  dcm map : %v", err))
+				continue dcmloop
+			}
+			utilruntime.HandleError(fmt.Errorf("unexpected error while reading  dcm map : %v", err))
+			break dcmloop
+		}
+
+		log.V(1).Info("KWDEBUG ", "row", row)
+		dcmLookup[row[1]] = row[2]
+	}
+
+	log.V(1).Info("KWDEBUG", "dcmlookup", dcmLookup)
 
 	reader := csv.NewReader(body)
 	reader.TrailingComma = true
@@ -465,7 +505,7 @@ loop:
 		}
 
 		rows++
-		e.parseRow(row, updatedValues)
+		e.parseRow(row, updatedValues, dcmLookup)
 	}
 
 	// swap the counter values
@@ -511,7 +551,7 @@ func (e *Exporter) collectMetrics(metrics chan<- prometheus.Metric) {
 // proxy and server names match our conventions they are labelled to the given route, service, or pod - if they don't match
 // then a generic label set is applied. If updatedValues is non-nil then the map will be populated with the updated counter state
 // for each metric.
-func (e *Exporter) parseRow(csvRow []string, updatedValues counterValuesByMetric) {
+func (e *Exporter) parseRow(csvRow []string, updatedValues counterValuesByMetric, dcmLookup map[string]string) {
 	pxname, svname, typ := csvRow[0], csvRow[1], csvRow[32]
 
 	switch typ {
@@ -520,6 +560,14 @@ func (e *Exporter) parseRow(csvRow []string, updatedValues counterValuesByMetric
 	case backendType:
 		if mode, value, ok := knownBackendSegment(pxname); ok {
 			if namespace, name, ok := parseNameSegment(value); ok {
+				if nameseg, ok := dcmLookup[pxname]; ok {
+					// the pxname name is found in the dcm_map, if the name parser okay, we use it as the source of
+					// namespace/name details.
+					if dcmnamespace, dcmname, ok := parseNameSegment(nameseg); ok {
+						namespace = dcmnamespace
+						name = dcmname
+					}
+				}
 				e.exportAndRecordRow(e.backendMetrics, metricID{proxyType: serverType, proxyName: pxname}, updatedValues, csvRow, mode, namespace, name)
 				return
 			}

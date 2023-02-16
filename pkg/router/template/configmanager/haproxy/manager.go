@@ -931,6 +931,12 @@ func (entry *routeBackendEntry) BuildMapAssociations(route *routev1.Route) {
 		associate("os_tcp_be.map", hostRE, name)
 		associate("os_sni_passthrough.map", hostRE, "1")
 	}
+
+	// TODO: if DCM enabled...
+
+	log.V(1).Info("KWDEBUG adding dcm entry")
+	associate("dcm_name.map", string(entry.BackendName()), templaterouter.ServiceAliasConfigKey(fmt.Sprintf("%s:%s", route.Namespace, route.Name)))
+
 }
 
 // buildBlueprintRoutes generates a list of blueprint routes.
